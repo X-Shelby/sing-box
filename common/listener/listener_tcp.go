@@ -28,6 +28,8 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	var err error
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
 	var listenConfig net.ListenConfig
+	listenConfig.Control = control.Append(listenConfig.Control, adapter.EBPFSocketProtectionControl(l.ctx))
+	listenConfig.Control = control.Append(listenConfig.Control, l.socketControl)
 	if l.listenOptions.BindInterface != "" {
 		listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
 	}
@@ -77,13 +79,17 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.logger.Info("tcp server started at ", tcpListener.Addr())
+	if !l.disableLog {
+		l.logger.Info("tcp server started at ", tcpListener.Addr())
+	}
 	l.tcpListener = tcpListener
 	return tcpListener, err
 }
 
 func (l *Listener) loopTCPIn() {
 	tcpListener := l.tcpListener
+	socketProtectFunc := adapter.EBPFSocketProtectionControl(l.ctx)
+	var nextSocketProtectionError time.Time
 	var metadata adapter.InboundContext
 	for {
 		conn, err := tcpListener.Accept()
@@ -100,12 +106,25 @@ func (l *Listener) loopTCPIn() {
 			l.logger.Error("tcp listener closed: ", err)
 			continue
 		}
+		if adapter.EBPFSocketProtectionSupported && socketProtectFunc != nil {
+			if err = adapter.ProtectEBPFSocket(socketProtectFunc, N.NetworkTCP, "", conn); err != nil {
+				_ = conn.Close()
+				now := time.Now()
+				if !now.Before(nextSocketProtectionError) {
+					l.logger.Error("protect accepted TCP socket: ", err)
+					nextSocketProtectionError = now.Add(10 * time.Second)
+				}
+				continue
+			}
+		}
 		//nolint:staticcheck
 		metadata.InboundDetour = l.listenOptions.Detour
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
 		ctx := log.ContextWithNewID(l.ctx)
-		l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+		if !l.disableLog {
+			l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+		}
 		go l.connHandler.NewConnection(ctx, conn, metadata, nil)
 	}
 }
